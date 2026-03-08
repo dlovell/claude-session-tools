@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+claude-transcript: Reconstruct Claude Code conversation sessions from JSONL files.
+
+Usage:
+  transcript [--list] [--project PROJECT] [SESSION_ID] [options]
+
+Examples:
+  transcript --list
+  transcript --list --project -home-dan-repos-github-xorq
+  transcript abc123
+  transcript abc123 --thinking --no-tools
+  transcript abc123 --output conversation.md
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import textwrap
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# ── ANSI colours (disabled when piping) ────────────────────────────────────
+USE_COLOR = sys.stdout.isatty()
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def bold(t):   return c(t, "1")
+def dim(t):    return c(t, "2")
+def cyan(t):   return c(t, "36")
+def green(t):  return c(t, "32")
+def yellow(t): return c(t, "33")
+def magenta(t):return c(t, "35")
+def red(t):    return c(t, "31")
+def blue(t):   return c(t, "34")
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def fmt_ts(ts_str):
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return ts_str
+
+
+def fmt_duration(ms):
+    if ms < 1000:
+        return f"{ms}ms"
+    elif ms < 60_000:
+        return f"{ms/1000:.1f}s"
+    else:
+        m, s = divmod(ms // 1000, 60)
+        return f"{m}m{s:02d}s"
+
+
+def wrap(text, width=100, indent=""):
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        if len(line) <= width:
+            out.append(indent + line)
+        else:
+            out.extend(textwrap.wrap(line, width=width, initial_indent=indent,
+                                     subsequent_indent=indent))
+    return "\n".join(out)
+
+
+# ── Session discovery ────────────────────────────────────────────────────────
+
+def find_sessions(project=None):
+    """Return list of (project_name, session_id, path, first_ts, slug)."""
+    sessions = []
+    if project:
+        # Support partial match: "xorq" matches "-home-dan-repos-github-xorq"
+        all_dirs = sorted(PROJECTS_DIR.iterdir())
+        projects = [d for d in all_dirs if project in d.name]
+        if not projects:
+            print(f"No project matching '{project}'. Available:", file=sys.stderr)
+            for d in all_dirs:
+                print(f"  {d.name}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        projects = sorted(PROJECTS_DIR.iterdir())
+    for proj_dir in projects:
+        if not proj_dir.is_dir():
+            continue
+        for f in proj_dir.glob("*.jsonl"):
+            session_id = f.stem
+            first_ts = None
+            slug = None
+            try:
+                with open(f) as fh:
+                    for line in fh:
+                        obj = json.loads(line)
+                        if first_ts is None:
+                            first_ts = obj.get("timestamp")
+                        if slug is None:
+                            slug = obj.get("slug")
+                        if first_ts and slug:
+                            break
+            except Exception:
+                pass
+            sessions.append((proj_dir.name, session_id, f, first_ts, slug))
+    sessions.sort(key=lambda x: x[3] or "")
+    return sessions
+
+
+def find_session_file(session_id):
+    """Find a .jsonl file matching session_id prefix anywhere under PROJECTS_DIR."""
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for f in proj_dir.glob("*.jsonl"):
+            if f.stem.startswith(session_id):
+                return f
+    return None
+
+
+# ── Record loading ───────────────────────────────────────────────────────────
+
+def load_records(path):
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def build_thread(records):
+    """
+    Reconstruct the main conversation thread using parentUuid links.
+    Returns an ordered list of records (excluding sidechains and pure metadata).
+    Also returns a mapping of uuid -> list-of-children for subagent nesting.
+    """
+    by_uuid = {}
+    children = {}  # uuid -> [child records]
+
+    for r in records:
+        uid = r.get("uuid")
+        if uid:
+            by_uuid[uid] = r
+
+    for r in records:
+        parent = r.get("parentUuid")
+        if parent:
+            children.setdefault(parent, []).append(r)
+
+    # Find roots (parentUuid is null, not a sidechain)
+    roots = [r for r in records
+             if r.get("parentUuid") is None
+             and not r.get("isSidechain", False)]
+
+    # Walk the chain: prefer non-sidechain children, follow by timestamp
+    def walk(node):
+        yield node
+        uid = node.get("uuid")
+        kids = [k for k in children.get(uid, [])
+                if not k.get("isSidechain", False)]
+        kids.sort(key=lambda x: x.get("timestamp", ""))
+        for kid in kids:
+            yield from walk(kid)
+
+    seen = set()
+    thread = []
+    for root in roots:
+        for r in walk(root):
+            uid = r.get("uuid")
+            if uid not in seen:
+                seen.add(uid)
+                thread.append(r)
+
+    return thread
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+def render_text_block(text, width=100):
+    return wrap(text.rstrip(), width=width)
+
+
+def render_tool_use(block, show_input=True):
+    name = block.get("name", "unknown_tool")
+    inp = block.get("input", {})
+    lines = [bold(cyan(f"  ⚙ tool_use: {name}"))]
+    if show_input and inp:
+        inp_str = json.dumps(inp, indent=2)
+        for line in inp_str.splitlines()[:30]:
+            lines.append(dim("    " + line))
+        if len(inp_str.splitlines()) > 30:
+            lines.append(dim("    ... (truncated)"))
+    return "\n".join(lines)
+
+
+def render_tool_result(block, show_content=True):
+    content = block.get("content", "")
+    if isinstance(content, list):
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        content = "\n".join(texts)
+    lines = [bold(green(f"  ✓ tool_result"))]
+    if show_content and content:
+        for line in str(content).splitlines()[:20]:
+            lines.append(dim("    " + line))
+        if len(str(content).splitlines()) > 20:
+            lines.append(dim("    ... (truncated)"))
+    return "\n".join(lines)
+
+
+def render_thinking(block):
+    thinking = block.get("thinking", "")
+    lines = [bold(magenta("  💭 thinking:"))]
+    for line in thinking.splitlines():
+        lines.append(magenta("    " + line))
+    return "\n".join(lines)
+
+
+def render_record(r, opts):
+    rtype = r.get("type")
+    ts = fmt_ts(r.get("timestamp", ""))
+    out = []
+
+    if rtype == "user":
+        msg = r.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            # Plain text user message
+            out.append(bold(green(f"\n{'─'*80}")))
+            out.append(bold(green(f"USER  [{ts}]")))
+            out.append(render_text_block(content))
+        elif isinstance(content, list):
+            has_real_content = False
+            for block in content:
+                btype = block.get("type")
+                if btype == "text":
+                    if not has_real_content:
+                        out.append(bold(green(f"\n{'─'*80}")))
+                        out.append(bold(green(f"USER  [{ts}]")))
+                        has_real_content = True
+                    out.append(render_text_block(block.get("text", "")))
+                elif btype == "tool_result" and opts.show_tools:
+                    if not has_real_content:
+                        out.append(dim(f"\n{'─'*80}"))
+                        has_real_content = True
+                    out.append(render_tool_result(block, show_content=opts.tool_output))
+
+    elif rtype == "assistant":
+        msg = r.get("message", {})
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            content = []
+
+        has_visible = any(
+            (b.get("type") == "thinking" and opts.show_thinking)
+            or (b.get("type") == "text")
+            or (b.get("type") == "tool_use" and opts.show_tools)
+            for b in content
+        )
+        if not has_visible:
+            return ""
+
+        out.append(bold(blue(f"\n{'─'*80}")))
+        model = r.get("message", {}).get("model", "")
+        model_str = f"  model={model}" if model else ""
+        out.append(bold(blue(f"ASSISTANT  [{ts}]{model_str}")))
+
+        for block in content:
+            btype = block.get("type")
+            if btype == "thinking" and opts.show_thinking:
+                out.append(render_thinking(block))
+            elif btype == "text":
+                out.append(render_text_block(block.get("text", "")))
+            elif btype == "tool_use" and opts.show_tools:
+                out.append(render_tool_use(block, show_input=opts.tool_input))
+
+    elif rtype == "system":
+        subtype = r.get("subtype", "")
+        if subtype == "compact_boundary":
+            pre_tokens = r.get("compactMetadata", {}).get("preTokens", "?")
+            trigger = r.get("compactMetadata", {}).get("trigger", "?")
+            out.append(yellow(f"\n{'━'*80}"))
+            out.append(yellow(f"⚡ COMPACTION [{ts}]  trigger={trigger}  pre_tokens={pre_tokens:,}" if isinstance(pre_tokens, int) else f"⚡ COMPACTION [{ts}]  trigger={trigger}"))
+            out.append(yellow(f"{'━'*80}"))
+        elif subtype == "turn_duration" and opts.show_timing:
+            ms = r.get("durationMs", 0)
+            out.append(dim(f"  ⏱ turn duration: {fmt_duration(ms)}"))
+
+    return "\n".join(out)
+
+
+def render_session_header(path, records):
+    # Pull metadata from first real record
+    session_id = None
+    slug = None
+    first_ts = None
+    last_ts = None
+    git_branch = None
+    cwd = None
+    version = None
+    n_compact = 0
+
+    for r in records:
+        if session_id is None:
+            session_id = r.get("sessionId")
+        if slug is None:
+            slug = r.get("slug")
+        if first_ts is None:
+            first_ts = r.get("timestamp")
+        last_ts = r.get("timestamp")
+        if git_branch is None:
+            git_branch = r.get("gitBranch")
+        if cwd is None:
+            cwd = r.get("cwd")
+        if version is None:
+            version = r.get("version")
+        if r.get("subtype") == "compact_boundary":
+            n_compact += 1
+
+    user_msgs = sum(1 for r in records if r.get("type") == "user"
+                    and isinstance(r.get("message", {}).get("content"), str))
+    asst_msgs = sum(1 for r in records if r.get("type") == "assistant")
+
+    lines = [
+        bold(f"{'═'*80}"),
+        bold(f"SESSION: {session_id}"),
+    ]
+    if slug:
+        lines.append(f"  slug:    {slug}")
+    if cwd:
+        lines.append(f"  cwd:     {cwd}")
+    if git_branch:
+        lines.append(f"  branch:  {git_branch}")
+    if version:
+        lines.append(f"  version: {version}")
+    if first_ts:
+        lines.append(f"  started: {fmt_ts(first_ts)}")
+    if last_ts:
+        lines.append(f"  ended:   {fmt_ts(last_ts)}")
+    lines.append(f"  turns:   {user_msgs} user / {asst_msgs} assistant")
+    lines.append(f"  compactions: {n_compact}")
+    lines.append(bold(f"{'═'*80}"))
+    return "\n".join(lines)
+
+
+# ── Ruff-failure audit ───────────────────────────────────────────────────────
+
+_RUFF_FAIL = re.compile(r"hook id: ruff-format|ruff format\.+Failed", re.I)
+
+
+def _record_tool_result_text(r):
+    """Extract all tool_result text from a user record."""
+    msg = r.get("message", {})
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            inner = block.get("content", "")
+            if isinstance(inner, list):
+                texts.extend(
+                    c.get("text", "") for c in inner
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+            elif isinstance(inner, str):
+                texts.append(inner)
+    return "\n".join(texts)
+
+
+def _count_tool_calls(records):
+    """Count tool_use blocks across a list of assistant records."""
+    n = 0
+    for r in records:
+        if r.get("type") != "assistant":
+            continue
+        for block in r.get("message", {}).get("content", []):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                n += 1
+    return n
+
+
+def audit_session(path):
+    """Return list of (incident_index, recovery_tool_calls) for ruff failures."""
+    records = load_records(path)
+    thread = build_thread(records)
+    incidents = []
+    for i, r in enumerate(thread):
+        if r.get("type") != "user":
+            continue
+        text = _record_tool_result_text(r)
+        if _RUFF_FAIL.search(text):
+            # count tool calls in the next 10 records as recovery work
+            recovery = _count_tool_calls(thread[i + 1 : i + 11])
+            incidents.append((i, recovery))
+    return incidents
+
+
+def cmd_audit(args):
+    sessions = find_sessions(args.project)
+    total_incidents = 0
+    total_recovery = 0
+    rows = []
+    for proj, sid, path, ts, slug in sessions:
+        incidents = audit_session(path)
+        if not incidents:
+            continue
+        n = len(incidents)
+        recovery = sum(r for _, r in incidents)
+        total_incidents += n
+        total_recovery += recovery
+        ts_str = fmt_ts(ts) if ts else ""
+        rows.append((ts_str, sid[:8], slug or "", n, recovery))
+
+    if not rows:
+        print("No ruff-format failures found.")
+        return
+
+    print(bold(f"{'STARTED':<22} {'SID':<8}  {'SLUG':<55} {'FAILS':>5}  {'RECOVERY':>8}"))
+    print("─" * 100)
+    for ts_str, sid, slug, n, recovery in rows:
+        print(f"{ts_str:<22} {sid:<8}  {red(slug):<55}  {n:>5}  {recovery:>8}")
+    print("─" * 100)
+    print(bold(f"{'TOTAL':<82} {total_incidents:>5}  {total_recovery:>8}"))
+    print()
+    print(dim(f"recovery = tool calls in the 10 records following each ruff-format failure"))
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def cmd_list(args):
+    sessions = find_sessions(args.project)
+    if not sessions:
+        print("No sessions found.")
+        return
+    print(bold(f"{'PROJECT':<50} {'SESSION ID':<38} {'STARTED':<22} SLUG"))
+    print("─" * 140)
+    for proj, sid, path, ts, slug in sessions:
+        ts_str = fmt_ts(ts) if ts else ""
+        slug_str = slug or ""
+        print(f"{proj:<50} {sid:<38} {ts_str:<22} {slug_str}")
+
+
+def cmd_show(args):
+    path = None
+    if args.session and os.path.exists(args.session):
+        path = Path(args.session)
+    elif args.session:
+        path = find_session_file(args.session)
+        if path is None:
+            print(f"Error: session '{args.session}' not found.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("Error: provide a session ID or path.", file=sys.stderr)
+        sys.exit(1)
+
+    records = load_records(path)
+    thread = build_thread(records)
+
+    output = []
+    output.append(render_session_header(path, records))
+
+    for r in thread:
+        rendered = render_record(r, args)
+        if rendered:
+            output.append(rendered)
+
+    result = "\n".join(output)
+
+    if args.output:
+        Path(args.output).write_text(result)
+        print(f"Written to {args.output}")
+    else:
+        print(result)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reconstruct Claude Code conversation transcripts from JSONL files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("session", nargs="?", help="Session ID (prefix) or path to .jsonl file")
+    parser.add_argument("--list", "-l", action="store_true", help="List available sessions")
+    parser.add_argument("--project", "-p", help="Filter by project directory name")
+    parser.add_argument("--thinking", action="store_true", default=False,
+                        help="Show Claude's thinking blocks (default: hidden)")
+    parser.add_argument("--no-tools", dest="show_tools", action="store_false", default=True,
+                        help="Hide tool calls and results")
+    parser.add_argument("--no-tool-input", dest="tool_input", action="store_false", default=True,
+                        help="Hide tool call inputs")
+    parser.add_argument("--no-tool-output", dest="tool_output", action="store_false", default=True,
+                        help="Hide tool result contents")
+    parser.add_argument("--timing", dest="show_timing", action="store_true", default=False,
+                        help="Show turn duration timings")
+    parser.add_argument("--output", "-o", help="Write output to file instead of stdout")
+    parser.add_argument("--audit", action="store_true",
+                        help="Audit sessions for ruff-format failures and recovery work")
+
+    # Alias
+    parser.add_argument("--show-thinking", dest="thinking", action="store_true",
+                        help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+    args.show_thinking = args.thinking
+
+    if args.audit:
+        cmd_audit(args)
+    elif args.list or (not args.session):
+        cmd_list(args)
+    else:
+        cmd_show(args)
+
+
+if __name__ == "__main__":
+    main()

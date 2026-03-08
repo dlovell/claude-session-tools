@@ -1,0 +1,7 @@
+{
+  "name": "claude-session-tools",
+  "description": "Search and audit Claude Code session history. Includes cc-search (find tool calls, file writes, text) and transcript (reconstruct full sessions with thinking blocks).",
+  "author": {
+    "name": "dlovell"
+  }
+}

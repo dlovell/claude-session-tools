@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+cc-search: Search Claude Code session JSONL files for tool calls, file writes, and content.
+
+Usage:
+  cc-search writes [PATTERN]            Find Write/Edit calls (optionally filter by path pattern)
+  cc-search tools [TOOL_NAME]           Find tool_use blocks (optionally filter by tool name)
+  cc-search text PATTERN                Search user/assistant message text
+  cc-search settings                    Shortcut: writes matching settings/config/memory files
+
+Options:
+  --project PROJECT     Filter by partial project name (e.g. "xorq")
+  --since DATE          Only show results after date (e.g. "2026-02-01")
+  --group               Group results by file path (writes modes only)
+  --content             Show full new_string/content (default: abbreviated)
+  --context             Show surrounding user message for context
+  --output FILE         Write results to file instead of stdout
+
+Examples:
+  cc-search settings
+  cc-search writes CLAUDE.md
+  cc-search writes memory/
+  cc-search tools Bash --project xorq
+  cc-search text "pre-commit" --project xorq
+  cc-search writes --since 2026-03-01
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from datetime import datetime, timezone
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# ── ANSI colours ─────────────────────────────────────────────────────────────
+USE_COLOR = sys.stdout.isatty()
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def bold(t):    return c(t, "1")
+def dim(t):     return c(t, "2")
+def cyan(t):    return c(t, "36")
+def green(t):   return c(t, "32")
+def yellow(t):  return c(t, "33")
+def magenta(t): return c(t, "35")
+def red(t):     return c(t, "31")
+def blue(t):    return c(t, "34")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def fmt_ts(ts_str):
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return ts_str
+
+
+def abbrev(text, max_len=400):
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + dim(f"  … [{len(text) - max_len} more chars]")
+
+
+def parse_since(since_str):
+    if not since_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m"):
+        try:
+            dt = datetime.strptime(since_str, fmt).replace(tzinfo=timezone.utc)
+            return dt.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
+    print(f"Warning: couldn't parse --since '{since_str}', ignoring.", file=sys.stderr)
+    return None
+
+
+# ── Session / project discovery ───────────────────────────────────────────────
+
+def iter_project_dirs(project_filter=None):
+    if not PROJECTS_DIR.exists():
+        print(f"Error: {PROJECTS_DIR} not found", file=sys.stderr)
+        sys.exit(1)
+    dirs = sorted(PROJECTS_DIR.iterdir())
+    if project_filter:
+        filtered = [d for d in dirs if project_filter in d.name]
+        if not filtered:
+            print(f"No project matching '{project_filter}'. Available:", file=sys.stderr)
+            for d in dirs:
+                print(f"  {d.name}", file=sys.stderr)
+            sys.exit(1)
+        return filtered
+    return [d for d in dirs if d.is_dir()]
+
+
+def load_records(path):
+    records = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def get_slug(records):
+    for r in records:
+        if r.get("slug"):
+            return r["slug"]
+    return ""
+
+
+def iter_sessions(project_filter=None):
+    """Yield (project_name, session_id, slug, records) for all sessions."""
+    for proj_dir in iter_project_dirs(project_filter):
+        for jsonl_file in sorted(proj_dir.glob("*.jsonl")):
+            try:
+                records = load_records(jsonl_file)
+            except Exception as e:
+                print(f"Warning: couldn't read {jsonl_file}: {e}", file=sys.stderr)
+                continue
+            session_id = jsonl_file.stem
+            slug = get_slug(records)
+            yield proj_dir.name, session_id, slug, records
+
+
+# ── Result formatting ─────────────────────────────────────────────────────────
+
+def print_header(n, label):
+    print(bold(f"\n{'═'*80}"))
+    print(bold(f"{n} result{'s' if n != 1 else ''} — {label}"))
+    print(bold(f"{'═'*80}"))
+
+
+def print_match(i, project, session_id, slug, ts, extra_lines):
+    sid_short = session_id[:8]
+    slug_str = f"  {dim(slug)}" if slug else ""
+    print(f"\n{bold(cyan(f'[{i}]'))}  {fmt_ts(ts)}")
+    print(f"     {dim(project)}  {yellow(sid_short)}{slug_str}")
+    for line in extra_lines:
+        print(f"     {line}")
+
+
+# ── Search modes ──────────────────────────────────────────────────────────────
+
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "str_replace_editor",
+               "str_replace_based_edit_tool", "create_file", "write_file", "edit_file"}
+
+SETTINGS_PATTERNS = re.compile(
+    r"(claude\.md|settings.*\.json|memory/.*\.md|memory\.md|/\.claude/)",
+    re.IGNORECASE,
+)
+
+
+def extract_file_path(tool_input):
+    return (tool_input.get("file_path") or tool_input.get("path") or
+            tool_input.get("filename") or "")
+
+
+def collect_writes(args, path_pattern=None, settings_only=False):
+    pat = re.compile(path_pattern, re.IGNORECASE) if path_pattern else None
+    since = parse_since(args.since)
+    results = []
+
+    for project, session_id, slug, records in iter_sessions(args.project):
+        by_uuid = {r.get("uuid"): r for r in records if r.get("uuid")}
+        for r in records:
+            if r.get("type") != "assistant":
+                continue
+            ts = r.get("timestamp", "")
+            if since and ts < since:
+                continue
+            content = r.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_name = block.get("name", "")
+                if tool_name not in WRITE_TOOLS:
+                    continue
+                inp = block.get("input", {})
+                file_path = extract_file_path(inp)
+                if not file_path:
+                    continue
+                if settings_only and not SETTINGS_PATTERNS.search(file_path):
+                    continue
+                if pat and not pat.search(file_path):
+                    continue
+                results.append((ts, project, session_id, slug, tool_name, file_path, inp, r, by_uuid))
+
+    results.sort(key=lambda x: x[0])
+    return results
+
+
+def format_write(ts, project, session_id, slug, tool_name, file_path, inp, rec, by_uuid, args, index=None):
+    new_str = inp.get("content") or inp.get("new_string") or ""
+    old_str = inp.get("old_string") or ""
+    lines = []
+    if index is not None:
+        lines.append(f"{bold(tool_name)}  {dim(fmt_ts(ts))}  {dim(session_id[:8])}  {dim(slug)}")
+    else:
+        lines.append(f"{bold(tool_name)}  →  {green(file_path)}")
+    if old_str:
+        lines.append(dim(f"old: {abbrev(old_str, 200 if not args.content else 2000)}"))
+    if new_str:
+        lines.append(f"new: {abbrev(new_str, 300 if not args.content else 4000)}")
+    if args.context:
+        parent_uuid = rec.get("parentUuid")
+        parent = by_uuid.get(parent_uuid, {})
+        pmsg = parent.get("message", {})
+        pc = pmsg.get("content", "")
+        user_text = ""
+        if isinstance(pc, str):
+            user_text = pc
+        elif isinstance(pc, list):
+            for b in pc:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    user_text = b.get("text", "")
+                    break
+        if user_text:
+            lines.append(dim(f"ctx: {abbrev(user_text, 150)}"))
+    return lines
+
+
+def search_writes(args, path_pattern=None, settings_only=False):
+    results = collect_writes(args, path_pattern=path_pattern, settings_only=settings_only)
+    label = "settings/config writes" if settings_only else f"writes matching {path_pattern!r}" if path_pattern else "all writes"
+
+    if getattr(args, "group", False):
+        # Group by file path, sorted by number of modifications descending
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for row in results:
+            groups[row[5]].append(row)  # row[5] = file_path
+
+        print_header(len(results), f"{label} — grouped by file ({len(groups)} files)")
+        for file_path in sorted(groups, key=lambda f: -len(groups[f])):
+            rows = groups[file_path]
+            print(f"\n{bold(green(file_path))}  {yellow(f'({len(rows)} modifications)')}")
+            for idx, (ts, project, session_id, slug, tool_name, fp, inp, rec, by_uuid) in enumerate(rows, 1):
+                lines = format_write(ts, project, session_id, slug, tool_name, fp, inp, rec, by_uuid, args, index=idx)
+                print(f"  {cyan(f'[{idx}]')}  " + lines[0])
+                for line in lines[1:]:
+                    print(f"       {line}")
+    else:
+        print_header(len(results), label)
+        for i, (ts, project, session_id, slug, tool_name, file_path, inp, rec, by_uuid) in enumerate(results, 1):
+            lines = format_write(ts, project, session_id, slug, tool_name, file_path, inp, rec, by_uuid, args)
+            print_match(i, project, session_id, slug, ts, lines)
+
+
+def search_tools(args, tool_name_filter=None):
+    pat = re.compile(tool_name_filter, re.IGNORECASE) if tool_name_filter else None
+    since = parse_since(args.since)
+    results = []
+
+    for project, session_id, slug, records in iter_sessions(args.project):
+        for r in records:
+            if r.get("type") != "assistant":
+                continue
+            ts = r.get("timestamp", "")
+            if since and ts < since:
+                continue
+            content = r.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tname = block.get("name", "")
+                if pat and not pat.search(tname):
+                    continue
+                inp = block.get("input", {})
+                results.append((ts, project, session_id, slug, tname, inp))
+
+    results.sort(key=lambda x: x[0])
+
+    label = f"tool calls matching {tool_name_filter!r}" if tool_name_filter else "all tool calls"
+    print_header(len(results), label)
+
+    for i, (ts, project, session_id, slug, tname, inp) in enumerate(results, 1):
+        inp_str = json.dumps(inp)
+        lines = [
+            f"{bold(cyan(tname))}  {abbrev(inp_str, 200 if not args.content else 2000)}",
+        ]
+        print_match(i, project, session_id, slug, ts, lines)
+
+
+def search_text(args, pattern):
+    pat = re.compile(pattern, re.IGNORECASE)
+    since = parse_since(args.since)
+    results = []
+
+    for project, session_id, slug, records in iter_sessions(args.project):
+        for r in records:
+            rtype = r.get("type")
+            ts = r.get("timestamp", "")
+            if since and ts < since:
+                continue
+            if rtype not in ("user", "assistant"):
+                continue
+            msg = r.get("message", {})
+            content = msg.get("content", "")
+            texts = []
+            if isinstance(content, str):
+                texts = [content]
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") in ("text", "thinking"):
+                        texts.append(b.get("text") or b.get("thinking") or "")
+                    elif b.get("type") == "tool_result":
+                        inner = b.get("content", "")
+                        if isinstance(inner, str):
+                            texts.append(inner)
+                        elif isinstance(inner, list):
+                            for ib in inner:
+                                if isinstance(ib, dict) and ib.get("type") == "text":
+                                    texts.append(ib.get("text", ""))
+            for text in texts:
+                m = pat.search(text)
+                if m:
+                    # extract snippet around match
+                    start = max(0, m.start() - 80)
+                    end = min(len(text), m.end() + 120)
+                    snippet = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+                    # highlight match
+                    snippet = pat.sub(lambda mx: bold(yellow(mx.group(0))), snippet)
+                    results.append((ts, project, session_id, slug, rtype, snippet))
+                    break  # one match per record
+
+    results.sort(key=lambda x: x[0])
+    print_header(len(results), f"text matching {pattern!r}")
+
+    for i, (ts, project, session_id, slug, rtype, snippet) in enumerate(results, 1):
+        role_str = bold(green("USER")) if rtype == "user" else bold(blue("ASST"))
+        lines = [f"{role_str}  {snippet}"]
+        print_match(i, project, session_id, slug, ts, lines)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search Claude Code session JSONL files for tool calls and content.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("mode", nargs="?", choices=["writes", "tools", "text", "settings"],
+                        help="Search mode")
+    parser.add_argument("pattern", nargs="?", help="Pattern or tool name to filter by")
+    parser.add_argument("--project", "-p", help="Filter by partial project name (e.g. 'xorq')")
+    parser.add_argument("--since", help="Only show results after date (e.g. '2026-02-01')")
+    parser.add_argument("--group", action="store_true", help="Group results by file path (writes/settings modes)")
+    parser.add_argument("--content", action="store_true", help="Show full content (not abbreviated)")
+    parser.add_argument("--context", action="store_true", help="Show preceding user message for context")
+    parser.add_argument("--output", "-o", help="Write output to file")
+
+    args = parser.parse_args()
+
+    if not args.mode:
+        parser.print_help()
+        sys.exit(0)
+
+    # Capture output to file if requested
+    if args.output:
+        import io
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+
+    try:
+        if args.mode == "settings":
+            search_writes(args, settings_only=True)
+        elif args.mode == "writes":
+            search_writes(args, path_pattern=args.pattern)
+        elif args.mode == "tools":
+            search_tools(args, tool_name_filter=args.pattern)
+        elif args.mode == "text":
+            if not args.pattern:
+                print("Error: 'text' mode requires a PATTERN argument.", file=sys.stderr)
+                sys.exit(1)
+            search_text(args, args.pattern)
+    finally:
+        if args.output:
+            sys.stdout = old_stdout
+            result = buf.getvalue()
+            Path(args.output).write_text(result)
+            print(f"Written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
