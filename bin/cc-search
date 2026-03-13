@@ -7,6 +7,8 @@ Usage:
   cc-search tools [TOOL_NAME]           Find tool_use blocks (optionally filter by tool name)
   cc-search text PATTERN                Search user/assistant message text
   cc-search settings                    Shortcut: writes matching settings/config/memory files
+  cc-search skills [SKILL_NAME]         Show skill invocations with user prompts
+  cc-search usage                       Show token usage per session
 
 Options:
   --project PROJECT     Filter by partial project name (e.g. "xorq")
@@ -353,6 +355,134 @@ def search_text(args, pattern):
         print_match(i, project, session_id, slug, ts, lines)
 
 
+# ── Skills mode ──────────────────────────────────────────────────────────────
+
+def search_skills(args, skill_filter=None):
+    """Show skill invocations with the user prompt that triggered them."""
+    pat = re.compile(skill_filter, re.IGNORECASE) if skill_filter else None
+    since = parse_since(args.since)
+    results = []
+
+    for project, session_id, slug, records in iter_sessions(args.project):
+        by_uuid = {r.get("uuid"): r for r in records if r.get("uuid")}
+        for i, r in enumerate(records):
+            if r.get("type") != "assistant":
+                continue
+            ts = r.get("timestamp", "")
+            if since and ts < since:
+                continue
+            content = r.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != "Skill":
+                    continue
+                inp = block.get("input", {})
+                skill_name = inp.get("skill", "")
+                if pat and not pat.search(skill_name):
+                    continue
+                skill_args = inp.get("args", "")
+                # Find the user message that triggered this
+                user_prompt = ""
+                parent_uuid = r.get("parentUuid")
+                parent = by_uuid.get(parent_uuid, {})
+                pmsg = parent.get("message", {})
+                pc = pmsg.get("content", "")
+                if isinstance(pc, str):
+                    user_prompt = pc
+                elif isinstance(pc, list):
+                    for b in pc:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            txt = b.get("text", "")
+                            # Skip system messages and tool results
+                            if txt and "command-message" not in txt[:50] and "Base directory" not in txt[:30]:
+                                user_prompt = txt
+                                break
+                results.append((ts, project, session_id, slug, skill_name, skill_args, user_prompt))
+
+    results.sort(key=lambda x: x[0])
+    label = f"skill invocations matching {skill_filter!r}" if skill_filter else "all skill invocations"
+    print_header(len(results), label)
+
+    for i, (ts, project, session_id, slug, skill_name, skill_args, user_prompt) in enumerate(results, 1):
+        args_str = f" {dim(skill_args)}" if skill_args else ""
+        lines = [f"{bold(magenta(f'/{skill_name}'))}{args_str}"]
+        if user_prompt:
+            lines.append(dim(f"prompt: {abbrev(user_prompt, 200)}"))
+        print_match(i, project, session_id, slug, ts, lines)
+
+
+# ── Usage mode ───────────────────────────────────────────────────────────────
+
+def search_usage(args):
+    """Show token usage aggregated per session."""
+    since = parse_since(args.since)
+    results = []
+
+    for project, session_id, slug, records in iter_sessions(args.project):
+        total_input = 0
+        total_output = 0
+        total_cache_read = 0
+        total_cache_create = 0
+        api_calls = 0
+        first_ts = None
+        last_ts = None
+
+        for r in records:
+            if r.get("type") != "assistant":
+                continue
+            ts = r.get("timestamp", "")
+            if since and ts < since:
+                continue
+            usage = r.get("message", {}).get("usage", {})
+            if not usage:
+                continue
+            api_calls += 1
+            total_input += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
+            total_cache_read += usage.get("cache_read_input_tokens", 0)
+            total_cache_create += usage.get("cache_creation_input_tokens", 0)
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+
+        if api_calls > 0:
+            results.append((
+                first_ts, project, session_id, slug, api_calls,
+                total_input, total_output, total_cache_read, total_cache_create,
+            ))
+
+    results.sort(key=lambda x: x[0])
+    print_header(len(results), "token usage by session")
+
+    grand_input = grand_output = grand_cache_read = grand_cache_create = grand_calls = 0
+    for i, (ts, project, session_id, slug, api_calls, inp, out, cache_r, cache_w) in enumerate(results, 1):
+        total = inp + cache_r + cache_w
+        lines = [
+            f"API calls: {bold(str(api_calls)):>6}  |  "
+            f"Output: {yellow(f'{out:>8,}')}  |  "
+            f"Cache read: {dim(f'{cache_r:>12,}')}  |  "
+            f"Cache write: {dim(f'{cache_w:>10,}')}  |  "
+            f"Total input: {bold(f'{total:>12,}')}",
+        ]
+        print_match(i, project, session_id, slug, ts, lines)
+        grand_input += inp
+        grand_output += out
+        grand_cache_read += cache_r
+        grand_cache_create += cache_w
+        grand_calls += api_calls
+
+    if len(results) > 1:
+        grand_total = grand_input + grand_cache_read + grand_cache_create
+        print(f"\n{bold('TOTAL')}: {grand_calls} API calls  |  "
+              f"Output: {grand_output:,}  |  "
+              f"Cache read: {grand_cache_read:,}  |  "
+              f"Cache write: {grand_cache_create:,}  |  "
+              f"Total input: {grand_total:,}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -361,7 +491,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("mode", nargs="?", choices=["writes", "tools", "text", "settings"],
+    parser.add_argument("mode", nargs="?", choices=["writes", "tools", "text", "settings", "skills", "usage"],
                         help="Search mode")
     parser.add_argument("pattern", nargs="?", help="Pattern or tool name to filter by")
     parser.add_argument("--project", "-p", help="Filter by partial project name (e.g. 'xorq')")
@@ -396,6 +526,10 @@ def main():
                 print("Error: 'text' mode requires a PATTERN argument.", file=sys.stderr)
                 sys.exit(1)
             search_text(args, args.pattern)
+        elif args.mode == "skills":
+            search_skills(args, skill_filter=args.pattern)
+        elif args.mode == "usage":
+            search_usage(args)
     finally:
         if args.output:
             sys.stdout = old_stdout
