@@ -12,7 +12,7 @@ Usage:
 
 Options:
   --project PROJECT     Filter by partial project name (e.g. "xorq")
-  --since DATE          Only show results after date (e.g. "2026-02-01")
+  --since DATE          Only show results after date (e.g. "2026-02-01", "3d", "2w", "1h")
   --group               Group results by file path (writes modes only)
   --content             Show full new_string/content (default: abbreviated)
   --context             Show surrounding user message for context
@@ -32,7 +32,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -76,6 +76,16 @@ def abbrev(text, max_len=400):
 def parse_since(since_str):
     if not since_str:
         return None
+    # Relative time deltas: 3d, 2w, 1h, 30m, etc.
+    m = re.match(r'^(\d+)([mhdwM])$', since_str)
+    if m:
+        amount, unit = int(m.group(1)), m.group(2)
+        units = {'m': 'minutes', 'h': 'hours', 'd': 'days', 'w': 'weeks'}
+        if unit == 'M':
+            dt = datetime.now(timezone.utc) - timedelta(days=amount * 30)
+        else:
+            dt = datetime.now(timezone.utc) - timedelta(**{units[unit]: amount})
+        return dt.isoformat().replace("+00:00", "Z")
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m"):
         try:
             dt = datetime.strptime(since_str, fmt).replace(tzinfo=timezone.utc)
@@ -495,7 +505,7 @@ def main():
                         help="Search mode")
     parser.add_argument("pattern", nargs="?", help="Pattern or tool name to filter by")
     parser.add_argument("--project", "-p", help="Filter by partial project name (e.g. 'xorq')")
-    parser.add_argument("--since", help="Only show results after date (e.g. '2026-02-01')")
+    parser.add_argument("--since", help="Only show results after date or relative delta (e.g. '2026-02-01', '3d', '2w', '1h', '30m')")
     parser.add_argument("--group", action="store_true", help="Group results by file path (writes/settings modes)")
     parser.add_argument("--content", action="store_true", help="Show full content (not abbreviated)")
     parser.add_argument("--context", action="store_true", help="Show preceding user message for context")
